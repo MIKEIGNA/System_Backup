@@ -4,6 +4,7 @@
 #include <vswriter.h>
 #include <vsbackup.h>
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <filesystem>
 #include <comdef.h>
