@@ -13,7 +13,7 @@
 // Link with vssapi.lib and other Windows libraries as needed
 #pragma comment(lib, "vssapi.lib")
 
-// Helper macro for HRESULT checking
+// Helper macro for HRESULT checking and logging
 #define CHECK_HR_AND_FAIL(hr, msg) \
     if (FAILED(hr)) { \
         std::cerr << msg << " (hr=0x" << std::hex << hr << ")\n"; \
@@ -41,6 +41,7 @@ public:
     }
 
     bool Initialize() {
+        // Using C++20 so this code is compiled with /std:c++20 in your project
         HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
         CHECK_HR_AND_FAIL(hr, "Failed to initialize COM");
 
@@ -66,9 +67,9 @@ public:
         HRESULT hr = backupComponents->StartSnapshotSet(&snapshotSetId);
         CHECK_HR_AND_FAIL(hr, "Failed to start snapshot set");
 
-        // Add the volume to the snapshot set
+        // Add the volume (e.g., "C:\") to the snapshot set. Note: cast to LPWSTR is needed.
         hr = backupComponents->AddToSnapshotSet(
-            (LPWSTR)sourceDrive.c_str(), // e.g. L"C:\\"
+            const_cast<LPWSTR>(sourceDrive.c_str()),
             GUID_NULL,
             &snapshotId
         );
@@ -102,17 +103,18 @@ public:
     }
 
     bool BackupToImage() {
-        // Get snapshot properties using the specific snapshotId
+        // Retrieve snapshot properties using the snapshotId
         VSS_SNAPSHOT_PROP snapProp;
         ZeroMemory(&snapProp, sizeof(snapProp));
 
         HRESULT hr = backupComponents->GetSnapshotProperties(snapshotId, &snapProp);
         if (FAILED(hr)) {
-            std::cerr << "Failed to get snapshot properties (hr=0x" << std::hex << hr << ")\n";
+            std::cerr << "Failed to get snapshot properties (hr=0x"
+                << std::hex << hr << ")\n";
             return false;
         }
 
-        // Ensure we got a valid shadow copy device path
+        // Validate the shadow copy device path
         std::wstring shadowPath = snapProp.m_pwszSnapshotDeviceObject;
         if (shadowPath.empty()) {
             std::cerr << "Snapshot device path is empty.\n";
@@ -121,14 +123,14 @@ public:
         }
         std::wcout << L"Shadow copy device: " << shadowPath << std::endl;
 
-        // Open the shadow copy device for raw read
+        // Open the shadow copy device for raw reading
         HANDLE hShadow = CreateFileW(
             shadowPath.c_str(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             NULL,
             OPEN_EXISTING,
-            FILE_FLAG_NO_BUFFERING,  // optional: reduces caching
+            FILE_FLAG_NO_BUFFERING,  // Optional flag to reduce caching overhead
             NULL
         );
         if (hShadow == INVALID_HANDLE_VALUE) {
@@ -138,7 +140,7 @@ public:
             return false;
         }
 
-        // Query the total length of the volume
+        // Get the total volume size
         GET_LENGTH_INFORMATION lengthInfo;
         DWORD bytesReturned = 0;
         if (!DeviceIoControl(
@@ -162,13 +164,13 @@ public:
         ULONGLONG totalBytes = lengthInfo.Length.QuadPart;
         std::wcout << L"Volume size: " << totalBytes << L" bytes\n";
 
-        // Create output directory if needed
+        // Ensure the destination directory exists
         std::filesystem::path outPath = imagePath;
         if (outPath.has_parent_path()) {
             std::filesystem::create_directories(outPath.parent_path());
         }
 
-        // Open the image file for writing
+        // Open the output image file
         HANDLE hImgFile = CreateFileW(
             imagePath.c_str(),
             GENERIC_WRITE,
@@ -188,11 +190,11 @@ public:
 
         const DWORD BUF_SIZE = 1024 * 1024; // 1 MB buffer
         std::unique_ptr<char[]> buffer(new char[BUF_SIZE]);
-
         LARGE_INTEGER offset;
         offset.QuadPart = 0;
         ULONGLONG bytesReadTotal = 0;
 
+        // Read the entire volume in chunks
         while (bytesReadTotal < totalBytes) {
             DWORD toRead = (DWORD)std::min<ULONGLONG>(BUF_SIZE, totalBytes - bytesReadTotal);
             DWORD dwRead = 0;
@@ -211,11 +213,10 @@ public:
                 break;
             }
             if (dwRead == 0) {
-                // End of file reached unexpectedly.
+                // Unexpected end of file
                 break;
             }
 
-            // Write the buffer to the image file
             DWORD dwWritten = 0;
             ok = WriteFile(hImgFile, buffer.get(), dwRead, &dwWritten, NULL);
             if (!ok || dwWritten != dwRead) {
@@ -228,7 +229,8 @@ public:
             bytesReadTotal += dwRead;
         }
 
-        std::wcout << L"Finished reading " << bytesReadTotal << L" bytes out of " << totalBytes << L"\n";
+        std::wcout << L"Finished reading " << bytesReadTotal
+            << L" bytes out of " << totalBytes << L"\n";
 
         CloseHandle(hImgFile);
         CloseHandle(hShadow);
@@ -254,7 +256,8 @@ public:
                 hr = pAsync->Wait();
                 pAsync->Release();
                 if (FAILED(hr)) {
-                    std::cerr << "BackupComplete Wait() failed (hr=0x" << std::hex << hr << ")\n";
+                    std::cerr << "BackupComplete Wait() failed (hr=0x"
+                        << std::hex << hr << ")\n";
                     return false;
                 }
             }
@@ -301,7 +304,7 @@ int wmain() {
         volume = L"C:\\";
     }
 
-    std::wcout << L"Enter path to output .img file (e.g., D:\\Backup\\MyDisk.img): ";
+    std::wcout << L"Enter path to output .img file (e.g., D:\\Backups\\MyDisk.img): ";
     std::getline(std::wcin, destImg);
     if (destImg.empty()) {
         std::wcerr << L"No destination path provided.\n";
@@ -324,6 +327,7 @@ int wmain() {
     std::cout << "Performing block-level backup to image...\n";
     if (!backup.BackupToImage()) {
         std::cerr << "BackupToImage failed.\n";
+        // We attempt Cleanup even if backup failed.
     }
 
     std::cout << "Cleaning up...\n";
