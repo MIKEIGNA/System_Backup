@@ -1,5 +1,4 @@
 #include <windows.h>
-#include <winioctl.h>
 #include <vss.h>
 #include <vswriter.h>
 #include <vsbackup.h>
@@ -8,15 +7,40 @@
 #include <string>
 #include <filesystem>
 #include <comdef.h>
-#include <memory>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
 
 #pragma comment(lib, "vssapi.lib")
 
-#define CHECK_HR(hr, msg) \
-    if (FAILED(hr)) { \
-        std::cerr << msg << " (hr=0x" << std::hex << hr << ")\n"; \
-        return false; \
+// Helper function to get formatted timestamp
+std::wstring GetTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto now_c = std::chrono::system_clock::to_time_t(now);
+    std::wstringstream ss;
+    ss << std::put_time(std::localtime(&now_c), L"%Y%m%d_%H%M%S");
+    return ss.str();
+}
+
+// Helper function to log errors
+void LogError(const std::wstring& logFile, const std::wstring& message) {
+    std::wofstream log(logFile, std::ios::app);
+    if (log.is_open()) {
+        log << GetTimestamp() << L" ERROR: " << message << std::endl;
+        log.close();
     }
+    std::wcerr << message << std::endl;
+}
+
+// Helper function to log info
+void LogInfo(const std::wstring& logFile, const std::wstring& message) {
+    std::wofstream log(logFile, std::ios::app);
+    if (log.is_open()) {
+        log << GetTimestamp() << L" INFO: " << message << std::endl;
+        log.close();
+    }
+    std::wcout << message << std::endl;
+}
 
 class SystemImageBackup {
 private:
@@ -24,10 +48,13 @@ private:
     VSS_ID snapshotSetId;
     std::wstring sourceDrive;
     std::wstring destPath;
+    std::wstring logFile;
 
 public:
     SystemImageBackup(const std::wstring& source, const std::wstring& destination)
         : backupComponents(nullptr), sourceDrive(source), destPath(destination) {
+        // Create log file in destination directory
+        logFile = destPath + L"\\backup_log_" + GetTimestamp() + L".txt";
     }
 
     ~SystemImageBackup() {
@@ -38,83 +65,149 @@ public:
     }
 
     bool Initialize() {
+        LogInfo(logFile, L"Initializing backup components...");
+
         HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-        CHECK_HR(hr, "Failed to initialize COM");
+        if (FAILED(hr)) {
+            LogError(logFile, L"Failed to initialize COM: 0x" + std::to_wstring(hr));
+            return false;
+        }
 
         hr = CreateVssBackupComponents(&backupComponents);
-        CHECK_HR(hr, "Failed to create backup components");
+        if (FAILED(hr)) {
+            LogError(logFile, L"Failed to create backup components: 0x" + std::to_wstring(hr));
+            return false;
+        }
 
         hr = backupComponents->InitializeForBackup();
-        CHECK_HR(hr, "Failed to initialize for backup");
+        if (FAILED(hr)) {
+            LogError(logFile, L"Failed to initialize for backup: 0x" + std::to_wstring(hr));
+            return false;
+        }
 
         hr = backupComponents->SetContext(VSS_CTX_BACKUP);
-        CHECK_HR(hr, "Failed to set backup context");
+        if (FAILED(hr)) {
+            LogError(logFile, L"Failed to set backup context: 0x" + std::to_wstring(hr));
+            return false;
+        }
 
+        LogInfo(logFile, L"Initialization successful");
         return true;
     }
 
     bool CreateSnapshot() {
+        LogInfo(logFile, L"Creating VSS snapshot...");
+
         HRESULT hr = backupComponents->StartSnapshotSet(&snapshotSetId);
-        CHECK_HR(hr, "Failed to start snapshot set");
+        if (FAILED(hr)) {
+            LogError(logFile, L"Failed to start snapshot set: 0x" + std::to_wstring(hr));
+            return false;
+        }
 
         VSS_ID snapshotId;
         hr = backupComponents->AddToSnapshotSet((VSS_PWSZ)sourceDrive.c_str(), GUID_NULL, &snapshotId);
-        CHECK_HR(hr, "Failed to add volume to snapshot set");
+        if (FAILED(hr)) {
+            LogError(logFile, L"Failed to add volume to snapshot set: 0x" + std::to_wstring(hr));
+            return false;
+        }
 
+        LogInfo(logFile, L"Preparing for backup...");
         IVssAsync* async = nullptr;
         hr = backupComponents->PrepareForBackup(&async);
-        CHECK_HR(hr, "Failed to prepare for backup");
+        if (FAILED(hr)) {
+            LogError(logFile, L"PrepareForBackup failed: 0x" + std::to_wstring(hr));
+            return false;
+        }
 
         if (async) {
             hr = async->Wait();
             async->Release();
-            CHECK_HR(hr, "PrepareForBackup wait failed");
+            if (FAILED(hr)) {
+                LogError(logFile, L"PrepareForBackup wait failed: 0x" + std::to_wstring(hr));
+                return false;
+            }
         }
 
-        std::cout << "Creating shadow copy...\n";
+        LogInfo(logFile, L"Creating shadow copy...");
         IVssAsync* asyncSnapshot = nullptr;
         hr = backupComponents->DoSnapshotSet(&asyncSnapshot);
-        CHECK_HR(hr, "Failed to create snapshot");
+        if (FAILED(hr)) {
+            LogError(logFile, L"DoSnapshotSet failed: 0x" + std::to_wstring(hr));
+            return false;
+        }
 
         if (asyncSnapshot) {
             hr = asyncSnapshot->Wait();
             asyncSnapshot->Release();
-            CHECK_HR(hr, "DoSnapshotSet wait failed");
+            if (FAILED(hr)) {
+                LogError(logFile, L"DoSnapshotSet wait failed: 0x" + std::to_wstring(hr));
+                return false;
+            }
         }
 
+        LogInfo(logFile, L"Snapshot created successfully");
         return true;
     }
 
     bool PerformBackup() {
+        LogInfo(logFile, L"Starting backup process...");
+
         VSS_SNAPSHOT_PROP prop;
         HRESULT hr = backupComponents->GetSnapshotProperties(snapshotSetId, &prop);
-        CHECK_HR(hr, "Failed to get snapshot properties");
-
-        std::wstring shadowPath = prop.m_pwszSnapshotDeviceObject;
-        std::wcout << L"Shadow copy device: " << shadowPath << std::endl;
-
-        // Create destination directory if it doesn't exist
-        std::filesystem::create_directories(destPath);
-
-        // Use robocopy for reliable copying with system files
-        std::wstring robocopyCmd = L"robocopy \"" + shadowPath + L"\" \"" +
-            destPath + L"\" /MIR /B /R:1 /W:1 /XA:SH /COPY:DATSOU /DCOPY:DAT /MT:8";
-
-        std::wcout << L"Starting backup using robocopy...\n";
-        int result = _wsystem(robocopyCmd.c_str());
-
-        VssFreeSnapshotProperties(&prop);
-
-        // Robocopy returns various codes, most non-zero codes are informational
-        if (result >= 8) {
-            std::cerr << "Robocopy encountered errors during copy\n";
+        if (FAILED(hr)) {
+            LogError(logFile, L"Failed to get snapshot properties: 0x" + std::to_wstring(hr));
             return false;
         }
 
+        std::wstring shadowPath = prop.m_pwszSnapshotDeviceObject;
+        LogInfo(logFile, L"Shadow copy device: " + shadowPath);
+
+        try {
+            // Create destination directory
+            std::filesystem::create_directories(destPath);
+
+            // Create a batch file for robocopy
+            std::wstring batchPath = destPath + L"\\backup_script.bat";
+            std::wofstream batchFile(batchPath);
+            if (!batchFile.is_open()) {
+                LogError(logFile, L"Failed to create backup script");
+                return false;
+            }
+
+            // Write robocopy commands to batch file
+            batchFile << L"@echo off\n";
+            batchFile << L"echo Starting system backup...\n";
+            batchFile << L"robocopy \"" << shadowPath << "\" \"" << destPath << L"\\System_Backup\" "
+                << L"/MIR /B /R:1 /W:1 /XA:SH /COPY:DATSOU /DCOPY:DAT /MT:8 /LOG:\""
+                << destPath << L"\\robocopy_log.txt\"\n";
+            batchFile << L"echo Backup complete. Check robocopy_log.txt for details.\n";
+            batchFile << L"pause\n";
+            batchFile.close();
+
+            // Execute the batch file
+            LogInfo(logFile, L"Executing backup script...");
+            std::wstring command = L"cmd.exe /c \"" + batchPath + L"\"";
+            int result = _wsystem(command.c_str());
+
+            if (result >= 8) {
+                LogError(logFile, L"Robocopy encountered errors during backup. Check robocopy_log.txt for details.");
+                return false;
+            }
+
+            LogInfo(logFile, L"Backup completed successfully");
+        }
+        catch (const std::exception& e) {
+            LogError(logFile, L"Exception during backup: " + std::wstring(e.what(), e.what() + strlen(e.what())));
+            return false;
+        }
+
+        VssFreeSnapshotProperties(&prop);
         return true;
     }
 
     bool Cleanup() {
+        LogInfo(logFile, L"Starting cleanup...");
+
         IVssAsync* async = nullptr;
         HRESULT hr = backupComponents->BackupComplete(&async);
 
@@ -123,7 +216,13 @@ public:
             async->Release();
         }
 
-        return SUCCEEDED(hr);
+        if (FAILED(hr)) {
+            LogError(logFile, L"Cleanup failed: 0x" + std::to_wstring(hr));
+            return false;
+        }
+
+        LogInfo(logFile, L"Cleanup completed successfully");
+        return true;
     }
 };
 
@@ -147,8 +246,14 @@ bool IsAdmin() {
 }
 
 int main() {
+    // Create console window to keep it open
+    AllocConsole();
+    SetConsoleTitle(L"System Image Backup");
+
     if (!IsAdmin()) {
         std::cerr << "This program requires administrator privileges.\n";
+        std::cout << "Press Enter to exit...";
+        std::cin.get();
         return 1;
     }
 
@@ -163,35 +268,53 @@ int main() {
     std::getline(std::wcin, destPath);
     if (destPath.empty()) {
         std::cerr << "Destination path is required.\n";
+        std::cout << "Press Enter to exit...";
+        std::cin.get();
         return 1;
     }
 
-    SystemImageBackup backup(sourceDrive, destPath);
+    try {
+        SystemImageBackup backup(sourceDrive, destPath);
 
-    std::cout << "Initializing backup...\n";
-    if (!backup.Initialize()) {
-        std::cerr << "Initialization failed\n";
-        return 1;
+        std::cout << "Initializing backup...\n";
+        if (!backup.Initialize()) {
+            std::cerr << "Initialization failed. Check the log file for details.\n";
+            std::cout << "Press Enter to exit...";
+            std::cin.get();
+            return 1;
+        }
+
+        std::cout << "Creating snapshot...\n";
+        if (!backup.CreateSnapshot()) {
+            std::cerr << "Snapshot creation failed. Check the log file for details.\n";
+            std::cout << "Press Enter to exit...";
+            std::cin.get();
+            return 1;
+        }
+
+        std::cout << "Starting backup process...\n";
+        if (!backup.PerformBackup()) {
+            std::cerr << "Backup failed. Check the log file for details.\n";
+            std::cout << "Press Enter to exit...";
+            std::cin.get();
+            return 1;
+        }
+
+        std::cout << "Cleaning up...\n";
+        if (!backup.Cleanup()) {
+            std::cerr << "Cleanup failed. Check the log file for details.\n";
+            std::cout << "Press Enter to exit...";
+            std::cin.get();
+            return 1;
+        }
+
+        std::cout << "Backup completed successfully!\n";
+    }
+    catch (const std::exception& e) {
+        std::cerr << "An unexpected error occurred: " << e.what() << "\n";
     }
 
-    std::cout << "Creating snapshot...\n";
-    if (!backup.CreateSnapshot()) {
-        std::cerr << "Failed to create snapshot\n";
-        return 1;
-    }
-
-    std::cout << "Copying files...\n";
-    if (!backup.PerformBackup()) {
-        std::cerr << "Backup failed\n";
-        return 1;
-    }
-
-    std::cout << "Cleaning up...\n";
-    if (!backup.Cleanup()) {
-        std::cerr << "Cleanup failed\n";
-        return 1;
-    }
-
-    std::cout << "Backup completed successfully!\n";
+    std::cout << "Press Enter to exit...";
+    std::cin.get();
     return 0;
 }
