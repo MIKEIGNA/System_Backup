@@ -8,7 +8,7 @@
 #include <comdef.h>
 #include <system_error>
 
-// Link with vssapi.lib (and automatically, ole32.lib, etc.)
+// Link with vssapi.lib (MSVC will automatically link required Windows libraries)
 #pragma comment(lib, "vssapi.lib")
 
 // Helper macro for HRESULT error checking
@@ -39,7 +39,7 @@ public:
     }
 
     bool Initialize() {
-        // Initialize COM for multi-threaded concurrency.
+        // Initialize COM (multi-threaded)
         HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
         CHECK_HR_AND_FAIL(hr, "Failed to initialize COM");
 
@@ -49,7 +49,7 @@ public:
         hr = backupComponents->InitializeForBackup();
         CHECK_HR_AND_FAIL(hr, "Failed to initialize for backup");
 
-        // Set backup state: select components and backup bootable system state.
+        // Set backup state: select components & backup system state
         hr = backupComponents->SetBackupState(
             /*bSelectComponents=*/true,
             /*bBackupBootableSystemState=*/true,
@@ -66,9 +66,9 @@ public:
         HRESULT hr = backupComponents->StartSnapshotSet(&snapshotSetId);
         CHECK_HR_AND_FAIL(hr, "Failed to start snapshot set");
 
-        // Add the target volume to the snapshot set.
+        // Add the target volume (e.g. "C:\") to the snapshot set.
         hr = backupComponents->AddToSnapshotSet(
-            const_cast<LPWSTR>(sourceDrive.c_str()), // e.g. L"C:\\" 
+            const_cast<LPWSTR>(sourceDrive.c_str()),
             GUID_NULL,
             &snapshotId
         );
@@ -97,7 +97,6 @@ public:
                 CHECK_HR_AND_FAIL(hr, "DoSnapshotSet Wait() failed");
             }
         }
-
         return true;
     }
 
@@ -122,23 +121,38 @@ public:
         }
         std::wcout << L"Shadow copy device: " << shadowPath << std::endl;
 
-        // Use the shadow copy as the source directory.
-        // Note: The shadow copy device (e.g. "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyX")
-        // represents the root of the volume.
-        try {
-            // Ensure the destination folder exists.
-            std::filesystem::create_directories(destFolder);
+        // Map the shadow copy device to a drive letter (e.g., "Z:") using DefineDosDevice.
+        // DDD_RAW_TARGET_PATH tells the system to treat the target as a raw device path.
+        std::wstring mountPoint = L"Z:";  // Ensure this drive letter is not in use.
+        if (!DefineDosDeviceW(DDD_RAW_TARGET_PATH, mountPoint.c_str(), shadowPath.c_str())) {
+            std::cerr << "Failed to define DOS device for shadow copy (error=0x"
+                << std::hex << GetLastError() << ")\n";
+            VssFreeSnapshotProperties(&snapProp);
+            return false;
+        }
+        std::wstring srcPath = mountPoint + L"\\";  // Now use "Z:\" as the source directory.
+        std::wcout << L"Mounted shadow copy at: " << srcPath << std::endl;
 
-            // Perform a recursive file copy from the shadow copy to the destination folder.
-            std::filesystem::path srcPath(shadowPath);
+        // Ensure destination folder exists.
+        try {
+            std::filesystem::create_directories(destFolder);
+            // Recursively copy from the mounted shadow copy to the destination folder.
             std::filesystem::copy(srcPath, destFolder,
                 std::filesystem::copy_options::recursive |
                 std::filesystem::copy_options::overwrite_existing);
         }
         catch (const std::filesystem::filesystem_error& ex) {
             std::cerr << "Filesystem copy error: " << ex.what() << "\n";
+            // Remove the DOS device mapping before returning.
+            DefineDosDeviceW(DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION, mountPoint.c_str(), shadowPath.c_str());
             VssFreeSnapshotProperties(&snapProp);
             return false;
+        }
+
+        // Remove the DOS device mapping.
+        if (!DefineDosDeviceW(DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION, mountPoint.c_str(), shadowPath.c_str())) {
+            std::cerr << "Failed to remove DOS device mapping (error=0x"
+                << std::hex << GetLastError() << ")\n";
         }
 
         VssFreeSnapshotProperties(&snapProp);
@@ -227,7 +241,7 @@ int wmain() {
     std::cout << "Performing file-level backup...\n";
     if (!backup.FileLevelBackup()) {
         std::cerr << "FileLevelBackup failed.\n";
-        // We attempt Cleanup even if the backup fails.
+        // We'll attempt Cleanup even if backup fails.
     }
 
     std::cout << "Cleaning up...\n";
