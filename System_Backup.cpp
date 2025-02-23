@@ -22,8 +22,10 @@
     }
 
 //
-// VSSFileLevelBackup performs a file-level backup (copies files from the shadow copy)
-// using VSS to obtain a consistent snapshot of a given volume.
+// VSSFileLevelBackup performs a file-level backup using a VSS snapshot.
+// It creates a shadow copy of a given volume, obtains its device path,
+// maps it to drive letter Z: using the subst command, and then copies files
+// recursively to the destination folder.
 //
 class VSSFileLevelBackup {
 private:
@@ -110,16 +112,15 @@ public:
         }
         std::wcout << L"Shadow copy device: " << shadowPath << std::endl;
 
-        // Map the shadow copy device to a drive letter (Z:)
-        std::wstring mountPoint = L"Z:";
-        if (!DefineDosDeviceW(DDD_RAW_TARGET_PATH, mountPoint.c_str(), shadowPath.c_str())) {
-            std::cerr << "Failed to map shadow copy to " << std::string("Z:")
-                << " (error=0x" << std::hex << GetLastError() << ")\n";
+        // Use subst to map the shadow copy device to drive letter Z:
+        std::wstring substCommand = L"subst Z: \"" + shadowPath + L"\"";
+        if (_wsystem(substCommand.c_str()) != 0) {
+            std::wcerr << L"Failed to map shadow copy to drive Z: using subst command.\n";
             VssFreeSnapshotProperties(&snapProp);
             return false;
         }
-        std::wstring srcPath = mountPoint + L"\\";
-        std::wcout << L"Mounted shadow copy at: " << srcPath << std::endl;
+        std::wstring srcPath = L"Z:\\"; // Now use Z:\ as the source directory.
+        std::wcout << L"Mapped shadow copy to drive Z: (" << srcPath << L")\n";
 
         try {
             std::filesystem::create_directories(destFolder);
@@ -129,14 +130,15 @@ public:
         }
         catch (const std::filesystem::filesystem_error& ex) {
             std::cerr << "Filesystem copy error: " << ex.what() << "\n";
-            DefineDosDeviceW(DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION, mountPoint.c_str(), shadowPath.c_str());
+            // Remove mapping before returning.
+            _wsystem(L"subst Z: /d");
             VssFreeSnapshotProperties(&snapProp);
             return false;
         }
 
-        // Unmap the drive letter.
-        if (!DefineDosDeviceW(DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION, mountPoint.c_str(), shadowPath.c_str())) {
-            std::cerr << "Failed to remove drive mapping (error=0x" << std::hex << GetLastError() << ")\n";
+        // Remove the subst mapping.
+        if (_wsystem(L"subst Z: /d") != 0) {
+            std::wcerr << L"Failed to remove subst mapping for drive Z:\n";
         }
 
         VssFreeSnapshotProperties(&snapProp);
@@ -170,27 +172,26 @@ public:
 // Both results are written as binary files in the destination folder.
 //
 bool CapturePhysicalDriveMetadata(int driveNumber, const std::wstring& destFolder) {
-    // Build the physical drive path: "\\.\PhysicalDriveX"
     std::wstring drivePath = L"\\\\.\\PhysicalDrive" + std::to_wstring(driveNumber);
     HANDLE hDrive = CreateFileW(drivePath.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
         OPEN_EXISTING, 0, NULL);
     if (hDrive == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"Failed to open " << drivePath << L" (error=0x" << std::hex << GetLastError() << L")\n";
+        std::wcerr << L"Failed to open " << drivePath << L" (error=0x"
+            << std::hex << GetLastError() << L")\n";
         return false;
     }
 
-    // Read the first 4 KB for boot records (this should cover MBR or GPT header, etc.)
     const DWORD BOOT_RECORD_SIZE = 4096;
     std::unique_ptr<BYTE[]> bootRecord(new BYTE[BOOT_RECORD_SIZE]);
     DWORD bytesRead = 0;
     if (!ReadFile(hDrive, bootRecord.get(), BOOT_RECORD_SIZE, &bytesRead, NULL)) {
-        std::wcerr << L"ReadFile for boot record failed (error=0x" << std::hex << GetLastError() << L")\n";
+        std::wcerr << L"ReadFile for boot record failed (error=0x"
+            << std::hex << GetLastError() << L")\n";
         CloseHandle(hDrive);
         return false;
     }
 
-    // Write the boot record to a file in the destination folder.
     std::filesystem::path bootPath = std::filesystem::path(destFolder) / L"boot_record.bin";
     try {
         std::ofstream bootFile(bootPath, std::ios::binary);
@@ -209,7 +210,6 @@ bool CapturePhysicalDriveMetadata(int driveNumber, const std::wstring& destFolde
         return false;
     }
 
-    // Get the drive layout information.
     DWORD outSize = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + 128 * sizeof(PARTITION_INFORMATION_EX);
     std::unique_ptr<BYTE[]> layoutBuffer(new BYTE[outSize]);
     DWORD bytesReturned = 0;
@@ -221,7 +221,6 @@ bool CapturePhysicalDriveMetadata(int driveNumber, const std::wstring& destFolde
         return false;
     }
 
-    // Write the raw drive layout info to a binary file.
     std::filesystem::path layoutPath = std::filesystem::path(destFolder) / L"drive_layout.bin";
     try {
         std::ofstream layoutFile(layoutPath, std::ios::binary);
@@ -245,8 +244,8 @@ bool CapturePhysicalDriveMetadata(int driveNumber, const std::wstring& destFolde
 }
 
 //
-// Simple helper to check if drive letter Z is available.
-// Returns true if not present in GetLogicalDrives bitmask.
+// Simple helper to check if drive letter Z is available using GetLogicalDrives.
+//
 bool isDriveLetterAvailable(wchar_t letter) {
     DWORD drives = GetLogicalDrives();
     return (drives & (1 << (letter - L'A'))) == 0;
@@ -316,7 +315,7 @@ int wmain() {
         }
     }
 
-    // Check that drive letter Z is available for our VSS mount.
+    // Ensure drive letter Z is available.
     if (!isDriveLetterAvailable(L'Z')) {
         std::wcerr << L"Drive letter Z is in use. Please free it or choose a different letter.\n";
         return 1;
