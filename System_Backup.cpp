@@ -11,10 +11,10 @@
 #include <memory>
 #include <algorithm>
 
-// Link with vssapi.lib (MSVC will also link needed Windows libraries)
+// Link with vssapi.lib (MSVC will link additional Windows libraries automatically)
 #pragma comment(lib, "vssapi.lib")
 
-// Helper macro for HRESULT checking and logging
+// Helper macro for HRESULT error checking and logging
 #define CHECK_HR_AND_FAIL(hr, msg) \
     if (FAILED(hr)) { \
         std::cerr << msg << " (hr=0x" << std::hex << hr << ")\n"; \
@@ -22,10 +22,9 @@
     }
 
 //
-// VSSFileLevelBackup performs a file-level backup using a VSS snapshot.
-// It creates a shadow copy of a given volume, obtains its device path,
-// maps it to drive letter Z: using the subst command, and then copies files
-// recursively to the destination folder.
+// VSSFileLevelBackup uses VSS to create a snapshot of a volume,
+// then maps the snapshot’s device to a drive letter (via subst) so that
+// standard file copy routines (using std::filesystem) can copy files.
 //
 class VSSFileLevelBackup {
 private:
@@ -112,25 +111,49 @@ public:
         }
         std::wcout << L"Shadow copy device: " << shadowPath << std::endl;
 
-        // Use subst to map the shadow copy device to drive letter Z:
+        // Use the subst command to map the shadow copy device to drive letter Z:
         std::wstring substCommand = L"subst Z: \"" + shadowPath + L"\"";
-        if (_wsystem(substCommand.c_str()) != 0) {
-            std::wcerr << L"Failed to map shadow copy to drive Z: using subst command.\n";
+        int substResult = _wsystem(substCommand.c_str());
+        if (substResult != 0) {
+            std::wcerr << L"Failed to map shadow copy to drive Z: (subst returned " << substResult << L")\n";
             VssFreeSnapshotProperties(&snapProp);
             return false;
         }
-        std::wstring srcPath = L"Z:\\"; // Now use Z:\ as the source directory.
-        std::wcout << L"Mapped shadow copy to drive Z: (" << srcPath << L")\n";
+        std::wstring mappedPath = L"Z:\\";
+        std::wcout << L"Mapped shadow copy to drive Z: (" << mappedPath << L")\n";
 
+        // Enumerate the contents of the mapped drive to check accessibility
+        try {
+            auto dirIter = std::filesystem::directory_iterator(mappedPath);
+            size_t count = 0;
+            for (auto& entry : dirIter) {
+                ++count;
+            }
+            std::wcout << L"Found " << count << L" items in " << mappedPath << std::endl;
+            if (count == 0) {
+                std::wcerr << L"No files or folders detected at " << mappedPath << L".\n";
+            }
+        }
+        catch (const std::filesystem::filesystem_error& ex) {
+            std::cerr << "Error enumerating directory " << std::filesystem::path(mappedPath).string()
+                << ": " << ex.what() << "\n";
+            // Attempt to remove subst mapping
+            _wsystem(L"subst Z: /d");
+            VssFreeSnapshotProperties(&snapProp);
+            return false;
+        }
+
+        // Perform the recursive copy using std::filesystem
         try {
             std::filesystem::create_directories(destFolder);
-            std::filesystem::copy(srcPath, destFolder,
+            std::filesystem::copy(mappedPath, destFolder,
                 std::filesystem::copy_options::recursive |
                 std::filesystem::copy_options::overwrite_existing);
+            std::wcout << L"File-level backup completed from " << mappedPath
+                << L" to " << destFolder << std::endl;
         }
         catch (const std::filesystem::filesystem_error& ex) {
             std::cerr << "Filesystem copy error: " << ex.what() << "\n";
-            // Remove mapping before returning.
             _wsystem(L"subst Z: /d");
             VssFreeSnapshotProperties(&snapProp);
             return false;
@@ -202,7 +225,8 @@ bool CapturePhysicalDriveMetadata(int driveNumber, const std::wstring& destFolde
         }
         bootFile.write(reinterpret_cast<char*>(bootRecord.get()), bytesRead);
         bootFile.close();
-        std::wcout << L"Boot record (" << bytesRead << L" bytes) written to " << bootPath.wstring() << std::endl;
+        std::wcout << L"Boot record (" << bytesRead << L" bytes) written to "
+            << bootPath.wstring() << std::endl;
     }
     catch (const std::exception& ex) {
         std::wcerr << L"Exception writing boot record: " << ex.what() << std::endl;
@@ -231,7 +255,8 @@ bool CapturePhysicalDriveMetadata(int driveNumber, const std::wstring& destFolde
         }
         layoutFile.write(reinterpret_cast<char*>(layoutBuffer.get()), bytesReturned);
         layoutFile.close();
-        std::wcout << L"Drive layout (" << bytesReturned << L" bytes) written to " << layoutPath.wstring() << std::endl;
+        std::wcout << L"Drive layout (" << bytesReturned << L" bytes) written to "
+            << layoutPath.wstring() << std::endl;
     }
     catch (const std::exception& ex) {
         std::wcerr << L"Exception writing drive layout: " << ex.what() << std::endl;
