@@ -325,6 +325,7 @@ int wmain() {
     if (!backup.Cleanup()) {
         std::cerr << "BackupComplete failed.\n";
     }
+    // we shall now edit this
 
     std::cout << "Backup finished.\n";
     return 0;
