@@ -301,7 +301,7 @@ int wmain() {
         volume = L"C:\\";
     }
 
-    std::wcout << L"Enter path to output .img file (e.g., D:\\Backups\\MyDisk.img): ";
+    std::wcout << L"Enter path to output .img file (e.g., D:\\Backup\\MyDisk.img): ";
     std::getline(std::wcin, destImg);
     if (destImg.empty()) {
         std::wcerr << L"No destination path provided.\n";
