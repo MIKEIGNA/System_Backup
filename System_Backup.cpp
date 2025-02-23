@@ -1,5 +1,4 @@
 #include <windows.h>
-#include <winioctl.h>       // For IOCTL_DISK_GET_LENGTH_INFO
 #include <vss.h>
 #include <vswriter.h>
 #include <vsbackup.h>
@@ -7,33 +6,32 @@
 #include <string>
 #include <filesystem>
 #include <comdef.h>
-#include <memory>
-#include <algorithm>
+#include <system_error>
 
-// Link with vssapi.lib and other Windows libraries as needed
+// Link with vssapi.lib (and automatically, ole32.lib, etc.)
 #pragma comment(lib, "vssapi.lib")
 
-// Helper macro for HRESULT checking and logging
+// Helper macro for HRESULT error checking
 #define CHECK_HR_AND_FAIL(hr, msg) \
     if (FAILED(hr)) { \
         std::cerr << msg << " (hr=0x" << std::hex << hr << ")\n"; \
         return false; \
     }
 
-class VSSBlockLevelBackup {
+class VSSFileLevelBackup {
 private:
     IVssBackupComponents* backupComponents = nullptr;
     VSS_ID snapshotSetId = GUID_NULL;
     VSS_ID snapshotId = GUID_NULL;
     std::wstring sourceDrive;
-    std::wstring imagePath;
+    std::wstring destFolder;
 
 public:
-    VSSBlockLevelBackup(const std::wstring& source, const std::wstring& imgFile)
-        : sourceDrive(source), imagePath(imgFile) {
+    VSSFileLevelBackup(const std::wstring& source, const std::wstring& destination)
+        : sourceDrive(source), destFolder(destination) {
     }
 
-    ~VSSBlockLevelBackup() {
+    ~VSSFileLevelBackup() {
         if (backupComponents) {
             backupComponents->Release();
         }
@@ -41,7 +39,7 @@ public:
     }
 
     bool Initialize() {
-        // Using C++20 so this code is compiled with /std:c++20 in your project
+        // Initialize COM for multi-threaded concurrency.
         HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
         CHECK_HR_AND_FAIL(hr, "Failed to initialize COM");
 
@@ -49,8 +47,9 @@ public:
         CHECK_HR_AND_FAIL(hr, "Failed to create VSS backup components");
 
         hr = backupComponents->InitializeForBackup();
-        CHECK_HR_AND_FAIL(hr, "Failed to InitializeForBackup");
+        CHECK_HR_AND_FAIL(hr, "Failed to initialize for backup");
 
+        // Set backup state: select components and backup bootable system state.
         hr = backupComponents->SetBackupState(
             /*bSelectComponents=*/true,
             /*bBackupBootableSystemState=*/true,
@@ -63,19 +62,19 @@ public:
     }
 
     bool CreateSnapshot() {
-        // Start snapshot set
+        // Start a new snapshot set.
         HRESULT hr = backupComponents->StartSnapshotSet(&snapshotSetId);
         CHECK_HR_AND_FAIL(hr, "Failed to start snapshot set");
 
-        // Add the volume (e.g., "C:\") to the snapshot set. Note: cast to LPWSTR is needed.
+        // Add the target volume to the snapshot set.
         hr = backupComponents->AddToSnapshotSet(
-            const_cast<LPWSTR>(sourceDrive.c_str()),
+            const_cast<LPWSTR>(sourceDrive.c_str()), // e.g. L"C:\\" 
             GUID_NULL,
             &snapshotId
         );
         CHECK_HR_AND_FAIL(hr, "Failed to add volume to snapshot set");
 
-        // Prepare for backup
+        // Prepare for backup.
         {
             IVssAsync* pAsync = nullptr;
             hr = backupComponents->PrepareForBackup(&pAsync);
@@ -87,7 +86,7 @@ public:
             }
         }
 
-        // Create snapshot
+        // Create the snapshot.
         {
             IVssAsync* pAsyncSnapshot = nullptr;
             hr = backupComponents->DoSnapshotSet(&pAsyncSnapshot);
@@ -102,8 +101,8 @@ public:
         return true;
     }
 
-    bool BackupToImage() {
-        // Retrieve snapshot properties using the snapshotId
+    bool FileLevelBackup() {
+        // Retrieve snapshot properties using the specific snapshotId.
         VSS_SNAPSHOT_PROP snapProp;
         ZeroMemory(&snapProp, sizeof(snapProp));
 
@@ -114,7 +113,7 @@ public:
             return false;
         }
 
-        // Validate the shadow copy device path
+        // The snapshot properties include the shadow copy device path.
         std::wstring shadowPath = snapProp.m_pwszSnapshotDeviceObject;
         if (shadowPath.empty()) {
             std::cerr << "Snapshot device path is empty.\n";
@@ -123,124 +122,26 @@ public:
         }
         std::wcout << L"Shadow copy device: " << shadowPath << std::endl;
 
-        // Open the shadow copy device for raw reading
-        HANDLE hShadow = CreateFileW(
-            shadowPath.c_str(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL,
-            OPEN_EXISTING,
-            FILE_FLAG_NO_BUFFERING,  // Optional flag to reduce caching overhead
-            NULL
-        );
-        if (hShadow == INVALID_HANDLE_VALUE) {
-            std::cerr << "Failed to open shadow device for reading (error=0x"
-                << std::hex << GetLastError() << ")\n";
+        // Use the shadow copy as the source directory.
+        // Note: The shadow copy device (e.g. "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyX")
+        // represents the root of the volume.
+        try {
+            // Ensure the destination folder exists.
+            std::filesystem::create_directories(destFolder);
+
+            // Perform a recursive file copy from the shadow copy to the destination folder.
+            std::filesystem::path srcPath(shadowPath);
+            std::filesystem::copy(srcPath, destFolder,
+                std::filesystem::copy_options::recursive |
+                std::filesystem::copy_options::overwrite_existing);
+        }
+        catch (const std::filesystem::filesystem_error& ex) {
+            std::cerr << "Filesystem copy error: " << ex.what() << "\n";
             VssFreeSnapshotProperties(&snapProp);
             return false;
         }
 
-        // Get the total volume size
-        GET_LENGTH_INFORMATION lengthInfo;
-        DWORD bytesReturned = 0;
-        if (!DeviceIoControl(
-            hShadow,
-            IOCTL_DISK_GET_LENGTH_INFO,
-            NULL,
-            0,
-            &lengthInfo,
-            sizeof(lengthInfo),
-            &bytesReturned,
-            NULL
-        ))
-        {
-            std::cerr << "IOCTL_DISK_GET_LENGTH_INFO failed (error=0x"
-                << std::hex << GetLastError() << ")\n";
-            CloseHandle(hShadow);
-            VssFreeSnapshotProperties(&snapProp);
-            return false;
-        }
-
-        ULONGLONG totalBytes = lengthInfo.Length.QuadPart;
-        std::wcout << L"Volume size: " << totalBytes << L" bytes\n";
-
-        // Ensure the destination directory exists
-        std::filesystem::path outPath = imagePath;
-        if (outPath.has_parent_path()) {
-            std::filesystem::create_directories(outPath.parent_path());
-        }
-
-        // Open the output image file
-        HANDLE hImgFile = CreateFileW(
-            imagePath.c_str(),
-            GENERIC_WRITE,
-            0,
-            NULL,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            NULL
-        );
-        if (hImgFile == INVALID_HANDLE_VALUE) {
-            std::cerr << "Failed to create output image file (error=0x"
-                << std::hex << GetLastError() << ")\n";
-            CloseHandle(hShadow);
-            VssFreeSnapshotProperties(&snapProp);
-            return false;
-        }
-
-        const DWORD BUF_SIZE = 1024 * 1024; // 1 MB buffer
-        std::unique_ptr<char[]> buffer(new char[BUF_SIZE]);
-        LARGE_INTEGER offset;
-        offset.QuadPart = 0;
-        ULONGLONG bytesReadTotal = 0;
-
-        // Read the entire volume in chunks
-        while (bytesReadTotal < totalBytes) {
-            DWORD toRead = (DWORD)std::min<ULONGLONG>(BUF_SIZE, totalBytes - bytesReadTotal);
-            DWORD dwRead = 0;
-
-            if (!SetFilePointerEx(hShadow, offset, NULL, FILE_BEGIN)) {
-                std::cerr << "SetFilePointerEx failed at offset " << offset.QuadPart
-                    << " (error=0x" << std::hex << GetLastError() << ")\n";
-                break;
-            }
-
-            BOOL ok = ReadFile(hShadow, buffer.get(), toRead, &dwRead, NULL);
-            if (!ok) {
-                DWORD err = GetLastError();
-                std::cerr << "ReadFile failed at offset " << offset.QuadPart
-                    << " (error=0x" << std::hex << err << ")\n";
-                break;
-            }
-            if (dwRead == 0) {
-                // Unexpected end of file
-                break;
-            }
-
-            DWORD dwWritten = 0;
-            ok = WriteFile(hImgFile, buffer.get(), dwRead, &dwWritten, NULL);
-            if (!ok || dwWritten != dwRead) {
-                std::cerr << "WriteFile failed at offset " << offset.QuadPart
-                    << " (error=0x" << std::hex << GetLastError() << ")\n";
-                break;
-            }
-
-            offset.QuadPart += dwRead;
-            bytesReadTotal += dwRead;
-        }
-
-        std::wcout << L"Finished reading " << bytesReadTotal
-            << L" bytes out of " << totalBytes << L"\n";
-
-        CloseHandle(hImgFile);
-        CloseHandle(hShadow);
         VssFreeSnapshotProperties(&snapProp);
-
-        if (bytesReadTotal != totalBytes) {
-            std::cerr << "Incomplete backup: read " << bytesReadTotal
-                << " bytes, expected " << totalBytes << " bytes.\n";
-            return false;
-        }
         return true;
     }
 
@@ -256,8 +157,7 @@ public:
                 hr = pAsync->Wait();
                 pAsync->Release();
                 if (FAILED(hr)) {
-                    std::cerr << "BackupComplete Wait() failed (hr=0x"
-                        << std::hex << hr << ")\n";
+                    std::cerr << "BackupComplete Wait() failed (hr=0x" << std::hex << hr << ")\n";
                     return false;
                 }
             }
@@ -296,7 +196,7 @@ int wmain() {
     }
 
     std::wstring volume;
-    std::wstring destImg;
+    std::wstring destFolder;
 
     std::wcout << L"Enter volume to snapshot (e.g., C:\\): ";
     std::getline(std::wcin, volume);
@@ -304,14 +204,14 @@ int wmain() {
         volume = L"C:\\";
     }
 
-    std::wcout << L"Enter path to output .img file (e.g., D:\\Backups\\MyDisk.img): ";
-    std::getline(std::wcin, destImg);
-    if (destImg.empty()) {
-        std::wcerr << L"No destination path provided.\n";
+    std::wcout << L"Enter destination folder for file-level backup (e.g., D:\\Backup\\SystemFiles): ";
+    std::getline(std::wcin, destFolder);
+    if (destFolder.empty()) {
+        std::wcerr << L"No destination folder provided.\n";
         return 1;
     }
 
-    VSSBlockLevelBackup backup(volume, destImg);
+    VSSFileLevelBackup backup(volume, destFolder);
 
     if (!backup.Initialize()) {
         std::cerr << "Initialization failed.\n";
@@ -324,10 +224,10 @@ int wmain() {
         return 1;
     }
 
-    std::cout << "Performing block-level backup to image...\n";
-    if (!backup.BackupToImage()) {
-        std::cerr << "BackupToImage failed.\n";
-        // We attempt Cleanup even if backup failed.
+    std::cout << "Performing file-level backup...\n";
+    if (!backup.FileLevelBackup()) {
+        std::cerr << "FileLevelBackup failed.\n";
+        // We attempt Cleanup even if the backup fails.
     }
 
     std::cout << "Cleaning up...\n";
