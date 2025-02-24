@@ -3,6 +3,7 @@
 #include <vss.h>
 #include <vswriter.h>
 #include <vsbackup.h>
+#include <compressapi.h>    // For compression
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -11,13 +12,21 @@
 #include <memory>
 #include <algorithm>
 
-// Link with vssapi.lib (MSVC will link additional Windows libraries automatically)
+// Link with vssapi.lib and cabinet.lib for compression
 #pragma comment(lib, "vssapi.lib")
+#pragma comment(lib, "cabinet.lib")
 
 // Helper macro for HRESULT error checking and logging
 #define CHECK_HR_AND_FAIL(hr, msg) \
     if (FAILED(hr)) { \
         std::cerr << msg << " (hr=0x" << std::hex << hr << ")\n"; \
+        return false; \
+    }
+
+// Helper macro for Win32 error checking
+#define CHECK_WIN32_AND_FAIL(expr, msg) \
+    if (!(expr)) { \
+        std::cerr << msg << " (error=0x" << std::hex << GetLastError() << ")\n"; \
         return false; \
     }
 
@@ -28,6 +37,39 @@ private:
     VSS_ID snapshotId = GUID_NULL;
     std::wstring sourceDrive;
     std::wstring destFolder;
+
+    // Compress a single file into the compressor and write to output handle
+    bool CompressFile(const std::filesystem::path& sourcePath, COMPRESSOR_HANDLE compressor, HANDLE hOutput) {
+        std::ifstream inFile(sourcePath, std::ios::binary);
+        if (!inFile) {
+            std::cerr << "Failed to open source file: " << sourcePath.string() << "\n";
+            return false;
+        }
+
+        const size_t BUFFER_SIZE = 65536;  // 64 KB buffer
+        std::vector<char> inputBuffer(BUFFER_SIZE);
+        std::vector<BYTE> compressedBuffer(BUFFER_SIZE * 2);  // Larger buffer for compressed data
+        SIZE_T bytesCompressed;
+
+        while (inFile.read(inputBuffer.data(), BUFFER_SIZE) || inFile.gcount() > 0) {
+            SIZE_T bytesRead = static_cast<SIZE_T>(inFile.gcount());
+            BOOL success = Compress(compressor, inputBuffer.data(), bytesRead,
+                compressedBuffer.data(), compressedBuffer.size(), &bytesCompressed);
+            if (!success && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                compressedBuffer.resize(compressedBuffer.size() * 2);
+                success = Compress(compressor, inputBuffer.data(), bytesRead,
+                    compressedBuffer.data(), compressedBuffer.size(), &bytesCompressed);
+            }
+            CHECK_WIN32_AND_FAIL(success, "Compress failed for " + sourcePath.string());
+
+            DWORD bytesWritten;
+            success = WriteFile(hOutput, compressedBuffer.data(), static_cast<DWORD>(bytesCompressed), &bytesWritten, NULL);
+            CHECK_WIN32_AND_FAIL(success, "WriteFile failed for " + sourcePath.string());
+        }
+
+        inFile.close();
+        return true;
+    }
 
 public:
     VSSFileLevelBackup(const std::wstring& source, const std::wstring& destination)
@@ -106,7 +148,6 @@ public:
         }
         std::wcout << L"Shadow copy device: " << shadowPath << std::endl;
 
-        // Map the snapshot device to Z: using DefineDosDeviceW
         std::wstring driveLetter = L"Z:";
         if (!DefineDosDeviceW(0, driveLetter.c_str(), shadowPath.c_str())) {
             std::wcerr << L"Failed to map shadow copy to drive " << driveLetter << L" (error=0x"
@@ -117,13 +158,12 @@ public:
         std::wstring mappedPath = driveLetter + L"\\";
         std::wcout << L"Mapped shadow copy to drive " << driveLetter << L" (" << mappedPath << L")\n";
 
-        // Enumerate the contents of the mapped drive to check accessibility
+        // Check snapshot contents
         size_t count = 0;
         try {
             auto dirIter = std::filesystem::directory_iterator(mappedPath);
             for (auto& entry : dirIter) {
                 ++count;
-                // Log the first few entries for debugging
                 if (count <= 5) {
                     std::wcout << L"Found: " << entry.path().wstring() << L"\n";
                 }
@@ -141,29 +181,85 @@ public:
             return false;
         }
 
-        // Perform the recursive copy
-        try {
-            std::filesystem::create_directories(destFolder);
-            std::filesystem::copy(mappedPath, destFolder,
-                std::filesystem::copy_options::recursive |
-                std::filesystem::copy_options::overwrite_existing);
-            std::wcout << L"File-level backup completed from " << mappedPath
-                << L" to " << destFolder << std::endl;
-        }
-        catch (const std::filesystem::filesystem_error& ex) {
-            std::cerr << "Filesystem copy error: " << ex.what() << "\n";
+        // Create compressed output file
+        std::filesystem::path compressedPath = std::filesystem::path(destFolder) / L"system_backup.cmp";
+        std::filesystem::create_directories(destFolder);
+        HANDLE hOutput = CreateFileW(compressedPath.wstring().c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hOutput == INVALID_HANDLE_VALUE) {
+            std::wcerr << L"Failed to create compressed file " << compressedPath.wstring() << L" (error=0x"
+                << std::hex << GetLastError() << L")\n";
             DefineDosDeviceW(DDD_REMOVE_DEFINITION, driveLetter.c_str(), NULL);
             VssFreeSnapshotProperties(&snapProp);
             return false;
         }
 
-        // Remove the drive mapping
+        // Initialize compressor
+        COMPRESSOR_HANDLE compressor = NULL;
+        BOOL success = CreateCompressor(COMPRESS_ALGORITHM_MSZIP, NULL, &compressor);
+        if (!success) {
+            std::cerr << "Failed to create compressor (error=0x" << std::hex << GetLastError() << ")\n";
+            CloseHandle(hOutput);
+            DefineDosDeviceW(DDD_REMOVE_DEFINITION, driveLetter.c_str(), NULL);
+            VssFreeSnapshotProperties(&snapProp);
+            return false;
+        }
+
+        // Compress files
+        try {
+            size_t fileCount = 0;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(mappedPath)) {
+                if (entry.is_regular_file()) {
+                    if (!CompressFile(entry.path(), compressor, hOutput)) {
+                        CloseCompressor(compressor);
+                        CloseHandle(hOutput);
+                        DefineDosDeviceW(DDD_REMOVE_DEFINITION, driveLetter.c_str(), NULL);
+                        VssFreeSnapshotProperties(&snapProp);
+                        return false;
+                    }
+                    ++fileCount;
+                    if (fileCount % 100 == 0) {
+                        std::wcout << L"Compressed " << fileCount << L" files...\n";
+                    }
+                }
+            }
+            std::wcout << L"Total files compressed: " << fileCount << L"\n";
+
+            // Flush remaining compressed data
+            std::vector<BYTE> compressedBuffer(65536 * 2);
+            SIZE_T bytesCompressed;
+            success = Compress(compressor, NULL, 0, compressedBuffer.data(), compressedBuffer.size(), &bytesCompressed);
+            if (!success && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                compressedBuffer.resize(compressedBuffer.size() * 2);
+                success = Compress(compressor, NULL, 0, compressedBuffer.data(), compressedBuffer.size(), &bytesCompressed);
+            }
+            CHECK_WIN32_AND_FAIL(success, "Final Compress flush failed");
+
+            if (bytesCompressed > 0) {
+                DWORD bytesWritten;
+                success = WriteFile(hOutput, compressedBuffer.data(), static_cast<DWORD>(bytesCompressed), &bytesWritten, NULL);
+                CHECK_WIN32_AND_FAIL(success, "WriteFile failed for flush data");
+            }
+        }
+        catch (const std::filesystem::filesystem_error& ex) {
+            std::cerr << "Filesystem error during compression: " << ex.what() << "\n";
+            CloseCompressor(compressor);
+            CloseHandle(hOutput);
+            DefineDosDeviceW(DDD_REMOVE_DEFINITION, driveLetter.c_str(), NULL);
+            VssFreeSnapshotProperties(&snapProp);
+            return false;
+        }
+
+        CloseCompressor(compressor);
+        CloseHandle(hOutput);
+
+        // Cleanup
         if (!DefineDosDeviceW(DDD_REMOVE_DEFINITION, driveLetter.c_str(), NULL)) {
             std::wcerr << L"Failed to remove mapping for drive " << driveLetter << L" (error=0x"
                 << std::hex << GetLastError() << L")\n";
         }
 
         VssFreeSnapshotProperties(&snapProp);
+        std::wcout << L"Compressed backup written to " << compressedPath.wstring() << std::endl;
         return true;
     }
 
@@ -342,10 +438,10 @@ int wmain() {
         return 1;
     }
 
-    std::cout << "Performing file-level backup...\n";
+    std::cout << "Performing compressed file-level backup...\n";
     if (!backup.FileLevelBackup()) {
         std::cerr << "FileLevelBackup failed.\n";
-        return 1;  // Exit with error if backup fails
+        return 1;
     }
 
     std::cout << "Cleaning up VSS snapshot...\n";
